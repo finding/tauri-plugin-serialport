@@ -1,12 +1,14 @@
 use crate::error::Error;
 use crate::state::{ReadData, SerialportInfo, SerialportState};
+use rand::Rng;
+use rusqlite::{Connection, params};
 // use std::collections::HashMap;
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::Duration;
-use tauri::{command, AppHandle, Runtime, State, Window};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{command, AppHandle, Runtime, State, Window, Manager};
 
 /// `get_worksheet` 根据 `path` 和 `sheet_name` 获取文件 sheet 实例。
 fn get_serialport<T, F: FnOnce(&mut SerialportInfo) -> Result<T, Error>>(
@@ -86,6 +88,88 @@ fn get_stop_bits(value: Option<usize>) -> StopBits {
         },
         None => StopBits::Two,
     }
+}
+
+// sqlite
+fn create_db<R: Runtime>(app: AppHandle<R>) -> Result<Connection, Error> {
+    let app_dir = app.path_resolver().app_data_dir().expect("目录不存在");
+    let db_file = format!("{}/{}", app_dir.to_str().expect("目录不存在"), "/epvc.db");
+    let conn = Connection::open(db_file).expect("msg");
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS datas (
+                    id int NOT NULL,
+                    path varchar NOT NULL,
+                    device_id varchar NULL,
+                    date varchar NOT NULL,
+                    type varchar NOT NULL,
+                    source varchar NOT NULL,
+                    value int NOT NULL,
+                    attr0 varchar NULL,
+                    attr1 varchar NULL,
+                    attr2 varchar NULL,
+                    attr3 varchar NULL,
+                    attr4 varchar NULL,
+                    attr5 varchar NULL,
+                    PRIMARY KEY(id)
+                )", []);
+    Ok(conn)
+}
+
+fn get_id () -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let timestamp = now.as_millis();
+    let mut rng = rand::thread_rng();
+    let random = rng.gen_range(1000..9999);
+    return format!("{}{}", timestamp, random)
+}
+
+// 16进制转十进制
+fn hex2dec(hex: &str) -> i64 {
+    let hex_num = i64::from_str_radix(&hex.replace(" ", ""), 16).unwrap();
+    if hex_num > 0x7fffffff {
+        hex_num - 0x100000000
+    } else {
+        hex_num
+    }
+}
+
+#[derive(Debug)]
+struct SerialData {
+    id: String,
+    path: String,
+    date: String,
+    types: String,
+    source: String,
+    value: i64
+}
+
+fn db_insert(conn: Connection, data: &[u8], path: String) -> Result<(), Error> {
+    let data_to_str = data.iter().map(|&num| format!("{:02X}", num)).collect::<Vec<String>>().join(" ");
+    let data_to_replace = data_to_str.replace(" E2", "|E2");
+    let data_arr: Vec<String> = data_to_replace.split("|").map(|s| s.trim().parse().unwrap()).collect();
+    if !data_arr.is_empty() {
+        for item in data_arr {
+            let str_type = &item[3..5];
+            let str_data = &item[11..].replace(" ", "");
+            // let str_data_value = u32::from_str_radix(&str_data, 16).unwrap();
+            let str_data_value = hex2dec(&str_data);
+
+            let local = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let into_data = SerialData {
+                id: get_id(),
+                path: path.clone(),
+                date: local.to_string(),
+                types: str_type.to_owned(),
+                source: item,
+                value: str_data_value
+            };
+            println!("into_data => {:?}", into_data);
+            let _ = conn.execute(
+                "INSERT INTO 'datas' ('id', 'path', 'date', 'type', 'source', 'value') VALUES (?, ?, ?, ?, ?, ?)",
+                params![into_data.id, into_data.path, into_data.date, into_data.types, into_data.source, into_data.value]
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `available_ports` 获取串口列表
@@ -265,7 +349,7 @@ pub fn open<R: Runtime>(
 /// `read` 读取指定串口
 #[command]
 pub fn read<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     window: Window<R>,
     state: State<'_, SerialportState>,
     path: String,
@@ -278,6 +362,7 @@ pub fn read<R: Runtime>(
             Ok(())
         } else {
             println!("串口 {} 开始读取数据!", &path);
+
             match serialport_info.serialport.try_clone() {
                 Ok(mut serial) => {
                     let read_event = format!("plugin-serialport-read-{}", &path);
@@ -301,6 +386,17 @@ pub fn read<R: Runtime>(
                         match serial.read(serial_buf.as_mut_slice()) {
                             Ok(size) => {
                                 println!("串口 {} 读取数据大小: {}", &path, size);
+
+                                let createdb = create_db(app.clone());
+                                match createdb {
+                                    Ok(conn) => {
+                                        let _ = db_insert(conn, &serial_buf[..size], path.clone());
+                                    }
+                                    Err(e) => {
+                                        println!("链接数据库 {:?}", e);
+                                    }
+                                }
+
                                 match window.emit(
                                     &read_event,
                                     ReadData {
